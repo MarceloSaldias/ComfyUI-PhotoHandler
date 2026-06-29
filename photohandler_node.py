@@ -1,21 +1,20 @@
-"""ComfyUI node that fetches an image description from PhotoHandler.
+"""ComfyUI nodes that fetch image descriptions from PhotoHandler.
 
-The node calls PhotoHandler's local HTTP agent API (the hybrid local-agent
-server, http://127.0.0.1:17843 by default) to look up the description stored
-for a given absolute image path. Only the Python standard library is used so
-the node has no extra dependencies.
+Two nodes are provided, both backed by PhotoHandler's local HTTP agent (the
+hybrid local-agent server, http://127.0.0.1:17843 by default):
 
-PhotoHandler exposes two description mechanisms:
+  * ``PhotoHandlerDescription`` — look up by **absolute path** (the image must
+    live inside PhotoHandler's open library).
+  * ``PhotoHandlerDescriptionByImage`` — look up by **SHA-256 of the file**.
+    Useful when the path is not PhotoHandler's library path (e.g. an image
+    dragged into ComfyUI, which is copied verbatim into ``input/``). The bytes
+    are identical, so the hash matches PhotoHandler's stored ``file_hash``.
 
-  * the legacy single ``assets.description`` column, and
-  * *typed* descriptions (e.g. "Clothing", "Scene") keyed to named
-    ``description_types``.
-
-The API response carries both: a single selected ``description`` (chosen by the
-optional ``type`` query param, then the default type, then the legacy column)
-and a ``descriptions`` map of every named type -> text.
+Both report the single selected ``description`` plus the full ``descriptions``
+map of named typed descriptions. Only the Python standard library is used.
 """
 
+import hashlib
 import json
 import os
 import urllib.error
@@ -24,10 +23,11 @@ import urllib.request
 
 DEFAULT_BASE_URL = "http://127.0.0.1:17843"
 
-# Server-side error messages (from PhotoHandler's `ensure_readable`) that mean
-# "this image is simply not something PhotoHandler can describe" rather than a
-# real failure. PhotoHandler maps every error to HTTP 500, so we disambiguate
-# on the message text. These are treated as a normal empty result.
+# Server-side error messages (from PhotoHandler's `ensure_readable` / library
+# checks) that mean "this image is simply not something PhotoHandler can
+# describe" rather than a real failure. PhotoHandler maps every error to HTTP
+# 500, so we disambiguate on the message text and treat these as a normal
+# empty result.
 _BENIGN_ERROR_FRAGMENTS = (
     "outside the library",
     "no library is open",
@@ -39,8 +39,143 @@ def _base_url():
     return os.environ.get("PHOTOHANDLER_URL", DEFAULT_BASE_URL).rstrip("/")
 
 
+def _fetch_description(lookup, params):
+    """GET a description from PhotoHandler and return (description, json_map).
+
+    ``lookup`` is the route segment, ``"by-path"`` or ``"by-hash"``. ``params``
+    is the query dict (e.g. ``{"path": ...}`` or ``{"hash": ...}``, plus an
+    optional ``"type"``).
+
+    Returns a 2-tuple ``(description, descriptions_json)``. A missing asset or
+    an out-of-scope path yields ``("", "{}")`` — a normal result, not an error.
+    Raises ``RuntimeError`` when PhotoHandler is unreachable or returns a
+    genuine error.
+    """
+    query = urllib.parse.urlencode(params)
+    url = "{base}/api/assets/{lookup}/description?{query}".format(
+        base=_base_url(), lookup=lookup, query=query
+    )
+
+    request = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            status = response.getcode()
+            body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        return _handle_http_error(exc, url)
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            "Could not reach PhotoHandler at {base}. Is it running? "
+            "({reason})".format(base=_base_url(), reason=exc.reason)
+        ) from exc
+
+    if status != 200:
+        raise RuntimeError(
+            "PhotoHandler returned unexpected HTTP {code} for {url}".format(
+                code=status, url=url
+            )
+        )
+
+    return _parse_success(body)
+
+
+def _handle_http_error(exc, url):
+    """Decide whether an HTTP error is a normal empty result or a failure.
+
+    PhotoHandler reports a path outside the open library (or no library open)
+    as HTTP 500 with ``{"error": "..."}``. Those are normal "not in scope"
+    outcomes, so we return an empty result. Anything else (missing/unreadable
+    path, DB failure, unknown route) is a genuine error.
+    """
+    message = ""
+    try:
+        payload = json.loads(exc.read().decode("utf-8"))
+        if isinstance(payload, dict):
+            message = str(payload.get("error", ""))
+    except Exception:  # noqa: BLE001 - error body is best-effort only
+        message = ""
+
+    lowered = message.lower()
+    if any(fragment in lowered for fragment in _BENIGN_ERROR_FRAGMENTS):
+        return ("", "{}")
+
+    detail = ": {}".format(message) if message else ""
+    raise RuntimeError(
+        "PhotoHandler returned HTTP {code} for {url}{detail}".format(
+            code=exc.code, url=url, detail=detail
+        )
+    ) from exc
+
+
+def _parse_success(body):
+    """Extract (description, descriptions_json) from a 200 response.
+
+    The expected body is a JSON object::
+
+        {"path": ..., "description": "<text>",
+         "asset_id": <id|null>, "descriptions": {<type>: <text>, ...}}
+
+    Older/simpler shapes (a bare JSON string, or plain text) are handled
+    gracefully. A missing or null description is a normal empty result.
+    """
+    body = body.strip()
+    if not body:
+        return ("", "{}")
+
+    try:
+        data = json.loads(body)
+    except (ValueError, TypeError):
+        # Not JSON — treat the raw body as the description text.
+        return (body, "{}")
+
+    if isinstance(data, str):
+        return (data, "{}")
+
+    if isinstance(data, dict):
+        value = data.get("description")
+        description = value if isinstance(value, str) else ""
+        descriptions = data.get("descriptions")
+        if not isinstance(descriptions, dict):
+            descriptions = {}
+        return (description, json.dumps(descriptions))
+
+    return ("", "{}")
+
+
+def _sha256_file(path):
+    """Return the SHA-256 hexdigest of a file's bytes.
+
+    Matches PhotoHandler's scanner (``python/operations/scanner.py``), which
+    hashes the full file in chunks.
+    """
+    sha256 = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            sha256.update(chunk)
+    return sha256.hexdigest()
+
+
+def _resolve_image_path(image):
+    """Resolve a ComfyUI image-widget value to an on-disk path.
+
+    Inside ComfyUI, ``image`` is a filename in the input directory; we resolve
+    it via ``folder_paths``. Outside ComfyUI (e.g. tests), ``image`` is treated
+    as a direct filesystem path.
+    """
+    try:
+        import folder_paths
+
+        return folder_paths.get_annotated_filepath(image)
+    except Exception:  # noqa: BLE001 - folder_paths only exists inside ComfyUI
+        return image
+
+
+def _optional_description_type():
+    return {"description_type": ("STRING", {"default": "", "multiline": False})}
+
+
 class PhotoHandlerDescription:
-    """Fetch the stored description(s) for an image from PhotoHandler."""
+    """Fetch an image's description from PhotoHandler, by absolute path."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -48,15 +183,7 @@ class PhotoHandlerDescription:
             "required": {
                 "path": ("STRING", {"default": "", "multiline": False}),
             },
-            "optional": {
-                # Maps to the API's `?type=` param. Selects which named typed
-                # description fills the single `description` output. Empty =>
-                # PhotoHandler's default type, then the legacy column.
-                "description_type": (
-                    "STRING",
-                    {"default": "", "multiline": False},
-                ),
-            },
+            "optional": _optional_description_type(),
         }
 
     RETURN_TYPES = ("STRING", "STRING")
@@ -68,92 +195,66 @@ class PhotoHandlerDescription:
         params = {"path": path}
         if description_type:
             params["type"] = description_type
-        query = urllib.parse.urlencode(params)
-        url = "{base}/api/assets/by-path/description?{query}".format(
-            base=_base_url(), query=query
-        )
+        return _fetch_description("by-path", params)
 
-        request = urllib.request.Request(url, method="GET")
+
+class PhotoHandlerDescriptionByImage:
+    """Fetch an image's description from PhotoHandler, by SHA-256 of the file.
+
+    Takes a ComfyUI image input (upload widget). The file's bytes are hashed
+    and looked up against PhotoHandler's stored ``file_hash`` — so it works even
+    when ComfyUI has copied the image to its own ``input/`` directory and the
+    original library path is unavailable.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        image_input = ("STRING", {"default": "", "multiline": False})
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                status = response.getcode()
-                body = response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            return self._handle_http_error(exc, url)
-        except urllib.error.URLError as exc:
+            import folder_paths
+
+            input_dir = folder_paths.get_input_directory()
+            files = [
+                f
+                for f in os.listdir(input_dir)
+                if os.path.isfile(os.path.join(input_dir, f))
+            ]
+            image_input = (sorted(files), {"image_upload": True})
+        except Exception:  # noqa: BLE001 - only available inside ComfyUI
+            pass
+
+        return {
+            "required": {"image": image_input},
+            "optional": _optional_description_type(),
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("description", "descriptions_json")
+    FUNCTION = "get_description"
+    CATEGORY = "PhotoHandler"
+
+    @classmethod
+    def IS_CHANGED(cls, image, description_type=""):
+        # Re-run when the file's bytes change (ComfyUI otherwise caches outputs
+        # keyed on the unchanged filename).
+        path = _resolve_image_path(image)
+        try:
+            return _sha256_file(path)
+        except OSError:
+            return float("nan")
+
+    def get_description(self, image, description_type=""):
+        path = _resolve_image_path(image)
+        try:
+            file_hash = _sha256_file(path)
+        except OSError as exc:
             raise RuntimeError(
-                "Could not reach PhotoHandler at {base}. Is it running? "
-                "({reason})".format(base=_base_url(), reason=exc.reason)
+                "Could not read image file '{path}': {err}".format(
+                    path=path, err=exc
+                )
             ) from exc
 
-        if status != 200:
-            raise RuntimeError(
-                "PhotoHandler returned unexpected HTTP {code} for {url}".format(
-                    code=status, url=url
-                )
-            )
-
-        return self._parse_success(body)
-
-    def _handle_http_error(self, exc, url):
-        """Decide whether an HTTP error is a normal empty result or a failure.
-
-        PhotoHandler reports a path outside the open library (or no library
-        open) as HTTP 500 with ``{"error": "..."}``. Those are normal "not in
-        scope" outcomes for an arbitrary path fed from ComfyUI, so we return an
-        empty result. Anything else (missing/unreadable path, DB failure) is a
-        genuine error.
-        """
-        message = ""
-        try:
-            payload = json.loads(exc.read().decode("utf-8"))
-            if isinstance(payload, dict):
-                message = str(payload.get("error", ""))
-        except Exception:  # noqa: BLE001 - error body is best-effort only
-            message = ""
-
-        lowered = message.lower()
-        if any(fragment in lowered for fragment in _BENIGN_ERROR_FRAGMENTS):
-            return ("", "{}")
-
-        detail = ": {}".format(message) if message else ""
-        raise RuntimeError(
-            "PhotoHandler returned HTTP {code} for {url}{detail}".format(
-                code=exc.code, url=url, detail=detail
-            )
-        ) from exc
-
-    @staticmethod
-    def _parse_success(body):
-        """Extract (description, descriptions_json) from a 200 response.
-
-        The expected body is a JSON object::
-
-            {"path": ..., "description": "<text>",
-             "asset_id": <id|null>, "descriptions": {<type>: <text>, ...}}
-
-        Older/simpler shapes (a bare JSON string, or plain text) are handled
-        gracefully. A missing or null description is a normal empty result.
-        """
-        body = body.strip()
-        if not body:
-            return ("", "{}")
-
-        try:
-            data = json.loads(body)
-        except (ValueError, TypeError):
-            # Not JSON — treat the raw body as the description text.
-            return (body, "{}")
-
-        if isinstance(data, str):
-            return (data, "{}")
-
-        if isinstance(data, dict):
-            value = data.get("description")
-            description = value if isinstance(value, str) else ""
-            descriptions = data.get("descriptions")
-            if not isinstance(descriptions, dict):
-                descriptions = {}
-            return (description, json.dumps(descriptions))
-
-        return ("", "{}")
+        params = {"hash": file_hash}
+        if description_type:
+            params["type"] = description_type
+        return _fetch_description("by-hash", params)

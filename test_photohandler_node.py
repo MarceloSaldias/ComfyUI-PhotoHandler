@@ -1,6 +1,6 @@
-"""Tests for the PhotoHandler Description node.
+"""Tests for the PhotoHandler Description nodes.
 
-A lightweight local HTTP server stands in for PhotoHandler so the node can be
+A lightweight local HTTP server stands in for PhotoHandler so the nodes can be
 exercised end to end without any external dependencies. Run with::
 
     python test_photohandler_node.py
@@ -11,37 +11,53 @@ or under pytest::
 """
 
 import json
+import os
+import tempfile
 import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from photohandler_node import PhotoHandlerDescription
+from photohandler_node import (
+    PhotoHandlerDescription,
+    PhotoHandlerDescriptionByImage,
+    _sha256_file,
+)
 
 
 class _FakeHandler(BaseHTTPRequestHandler):
-    # Map of image path -> callable(query_params) -> (status, body) used by the
-    # running server.
-    responses = {}
+    # path-keyed and hash-keyed response specs for the running server. Each spec
+    # is either (status, body) or a callable(query_params) -> (status, body).
+    path_responses = {}
+    hash_responses = {}
 
     def log_message(self, *args):  # silence the test server
         pass
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
-        if parsed.path != "/api/assets/by-path/description":
+        params = urllib.parse.parse_qs(parsed.query)
+
+        if parsed.path == "/api/assets/by-path/description":
+            key = params.get("path", [""])[0]
+            spec = self.path_responses.get(key)
+            outside = json.dumps(
+                {"error": "Access denied: '%s' is outside the library" % key}
+            )
+        elif parsed.path == "/api/assets/by-hash/description":
+            key = params.get("hash", [""])[0]
+            spec = self.hash_responses.get(key)
+            # Mirror the by-hash endpoint: unknown hash is indexed-but-absent,
+            # reported as a normal empty 200 (no ensure_readable gate).
+            outside = json.dumps(
+                {"path": "", "description": "", "asset_id": None, "descriptions": {}}
+            )
+        else:
             self.send_response(404)
             self.end_headers()
             return
 
-        params = urllib.parse.parse_qs(parsed.query)
-        path = params.get("path", [""])[0]
-        spec = self.responses.get(path)
-
         if spec is None:
-            # Mirror PhotoHandler: a path outside the library is a 500, not a 404.
-            status, body = 500, json.dumps(
-                {"error": "Access denied: '%s' is outside the library" % path}
-            )
+            status, body = (200 if parsed.path.endswith("by-hash/description") else 500), outside
         elif callable(spec):
             status, body = spec(params)
         else:
@@ -53,27 +69,31 @@ class _FakeHandler(BaseHTTPRequestHandler):
         self.wfile.write(body.encode("utf-8"))
 
 
-def _start_server(responses):
-    _FakeHandler.responses = responses
+def _start_server(path_responses=None, hash_responses=None):
+    _FakeHandler.path_responses = path_responses or {}
+    _FakeHandler.hash_responses = hash_responses or {}
     server = HTTPServer(("127.0.0.1", 0), _FakeHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server
 
 
-def _run_node(monkeypatch_env, server):
+def _set_url(monkeypatch_env, server):
     host, port = server.server_address
     monkeypatch_env("PHOTOHANDLER_URL", "http://{}:{}".format(host, port))
-    return PhotoHandlerDescription().get_description
 
 
 def _ok(payload):
     return (200, json.dumps(payload))
 
 
-def test_returns_description_and_map_from_object(monkeypatch):
+# --------------------------------------------------------------------------
+# Path-based node
+# --------------------------------------------------------------------------
+
+def test_path_returns_description_and_map(monkeypatch):
     server = _start_server(
-        {
+        path_responses={
             "/lib/cat.jpg": _ok(
                 {
                     "path": "/lib/cat.jpg",
@@ -85,93 +105,54 @@ def test_returns_description_and_map_from_object(monkeypatch):
         }
     )
     try:
-        get = _run_node(monkeypatch.setenv, server)
-        desc, maps = get("/lib/cat.jpg")
+        _set_url(monkeypatch.setenv, server)
+        desc, maps = PhotoHandlerDescription().get_description("/lib/cat.jpg")
         assert desc == "a cat"
         assert json.loads(maps) == {"Scene": "a cat", "Clothing": "none"}
     finally:
         server.shutdown()
 
 
-def test_type_param_is_forwarded(monkeypatch):
+def test_path_type_param_is_forwarded(monkeypatch):
     def respond(params):
-        # The selected description echoes whichever type was requested.
         chosen = params.get("type", ["<none>"])[0]
         return _ok(
-            {
-                "path": "/lib/x.jpg",
-                "description": "for-" + chosen,
-                "asset_id": 2,
-                "descriptions": {"Clothing": "for-Clothing"},
-            }
+            {"path": "/lib/x.jpg", "description": "for-" + chosen, "asset_id": 2,
+             "descriptions": {}}
         )
 
-    server = _start_server({"/lib/x.jpg": respond})
+    server = _start_server(path_responses={"/lib/x.jpg": respond})
     try:
-        get = _run_node(monkeypatch.setenv, server)
-        assert get("/lib/x.jpg", "Clothing")[0] == "for-Clothing"
-        # No type -> param absent on the server side.
-        assert get("/lib/x.jpg")[0] == "for-<none>"
+        _set_url(monkeypatch.setenv, server)
+        node = PhotoHandlerDescription()
+        assert node.get_description("/lib/x.jpg", "Clothing")[0] == "for-Clothing"
+        assert node.get_description("/lib/x.jpg")[0] == "for-<none>"
     finally:
         server.shutdown()
 
 
-def test_indexed_but_no_description_returns_empty(monkeypatch):
+def test_path_outside_library_returns_empty(monkeypatch):
+    server = _start_server()  # no mapping -> 500 "outside the library"
+    try:
+        _set_url(monkeypatch.setenv, server)
+        assert PhotoHandlerDescription().get_description("/elsewhere.jpg") == ("", "{}")
+    finally:
+        server.shutdown()
+
+
+def test_path_unreadable_raises(monkeypatch):
     server = _start_server(
-        {
-            "/lib/blank.jpg": _ok(
-                {
-                    "path": "/lib/blank.jpg",
-                    "description": "",
-                    "asset_id": 3,
-                    "descriptions": {},
-                }
-            )
-        }
-    )
-    try:
-        get = _run_node(monkeypatch.setenv, server)
-        assert get("/lib/blank.jpg") == ("", "{}")
-    finally:
-        server.shutdown()
-
-
-def test_outside_library_returns_empty(monkeypatch):
-    # No mapping -> fake server replies 500 "outside the library".
-    server = _start_server({})
-    try:
-        get = _run_node(monkeypatch.setenv, server)
-        assert get("/somewhere/else.jpg") == ("", "{}")
-    finally:
-        server.shutdown()
-
-
-def test_no_library_open_returns_empty(monkeypatch):
-    server = _start_server(
-        {"/lib/y.jpg": (500, json.dumps({"error": "No library is open"}))}
-    )
-    try:
-        get = _run_node(monkeypatch.setenv, server)
-        assert get("/lib/y.jpg") == ("", "{}")
-    finally:
-        server.shutdown()
-
-
-def test_unreadable_path_raises(monkeypatch):
-    server = _start_server(
-        {
+        path_responses={
             "/lib/gone.jpg": (
                 500,
-                json.dumps(
-                    {"error": "Cannot access path '/lib/gone.jpg': No such file"}
-                ),
+                json.dumps({"error": "Cannot access path '/lib/gone.jpg': No such file"}),
             )
         }
     )
     try:
-        get = _run_node(monkeypatch.setenv, server)
+        _set_url(monkeypatch.setenv, server)
         try:
-            get("/lib/gone.jpg")
+            PhotoHandlerDescription().get_description("/lib/gone.jpg")
         except RuntimeError as exc:
             assert "Cannot access path" in str(exc)
         else:
@@ -180,8 +161,106 @@ def test_unreadable_path_raises(monkeypatch):
         server.shutdown()
 
 
+# --------------------------------------------------------------------------
+# Image / SHA-based node
+# --------------------------------------------------------------------------
+
+def _temp_image(content=b"fake-jpeg-bytes"):
+    fd, path = tempfile.mkstemp(suffix=".jpg")
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(content)
+    return path
+
+
+def test_image_lookup_by_hash(monkeypatch):
+    path = _temp_image(b"distinct-bytes-A")
+    sha = _sha256_file(path)
+    server = _start_server(
+        hash_responses={
+            sha: _ok(
+                {
+                    "path": "/lib/orig.jpg",
+                    "description": "matched by hash",
+                    "asset_id": 7,
+                    "descriptions": {"Scene": "matched by hash"},
+                }
+            )
+        }
+    )
+    try:
+        _set_url(monkeypatch.setenv, server)
+        # folder_paths is absent outside ComfyUI, so `image` is used as a path.
+        desc, maps = PhotoHandlerDescriptionByImage().get_description(path)
+        assert desc == "matched by hash"
+        assert json.loads(maps) == {"Scene": "matched by hash"}
+    finally:
+        server.shutdown()
+        os.remove(path)
+
+
+def test_image_type_param_is_forwarded(monkeypatch):
+    path = _temp_image(b"distinct-bytes-B")
+    sha = _sha256_file(path)
+
+    def respond(params):
+        chosen = params.get("type", ["<none>"])[0]
+        return _ok(
+            {"path": "/lib/o.jpg", "description": "for-" + chosen, "asset_id": 8,
+             "descriptions": {}}
+        )
+
+    server = _start_server(hash_responses={sha: respond})
+    try:
+        _set_url(monkeypatch.setenv, server)
+        node = PhotoHandlerDescriptionByImage()
+        assert node.get_description(path, "Clothing")[0] == "for-Clothing"
+    finally:
+        server.shutdown()
+        os.remove(path)
+
+
+def test_image_unknown_hash_returns_empty(monkeypatch):
+    path = _temp_image(b"never-seen-bytes")
+    server = _start_server(hash_responses={})  # unknown hash -> empty 200
+    try:
+        _set_url(monkeypatch.setenv, server)
+        assert PhotoHandlerDescriptionByImage().get_description(path) == ("", "{}")
+    finally:
+        server.shutdown()
+        os.remove(path)
+
+
+def test_image_missing_file_raises(monkeypatch):
+    server = _start_server()
+    try:
+        _set_url(monkeypatch.setenv, server)
+        try:
+            PhotoHandlerDescriptionByImage().get_description("/no/such/file.jpg")
+        except RuntimeError as exc:
+            assert "Could not read image file" in str(exc)
+        else:
+            raise AssertionError("expected RuntimeError for missing file")
+    finally:
+        server.shutdown()
+
+
+def test_is_changed_tracks_content(monkeypatch):
+    path = _temp_image(b"content-1")
+    try:
+        first = PhotoHandlerDescriptionByImage.IS_CHANGED(path)
+        with open(path, "wb") as handle:
+            handle.write(b"content-2-different")
+        second = PhotoHandlerDescriptionByImage.IS_CHANGED(path)
+        assert first != second
+    finally:
+        os.remove(path)
+
+
+# --------------------------------------------------------------------------
+# Shared
+# --------------------------------------------------------------------------
+
 def test_unreachable_raises(monkeypatch):
-    # Point at a port nothing is listening on.
     monkeypatch.setenv("PHOTOHANDLER_URL", "http://127.0.0.1:1")
     try:
         PhotoHandlerDescription().get_description("/lib/x.jpg")
@@ -192,10 +271,10 @@ def test_unreachable_raises(monkeypatch):
 
 
 def test_bare_string_response(monkeypatch):
-    server = _start_server({"/lib/dog.jpg": _ok("a dog")})
+    server = _start_server(path_responses={"/lib/dog.jpg": _ok("a dog")})
     try:
-        get = _run_node(monkeypatch.setenv, server)
-        assert get("/lib/dog.jpg") == ("a dog", "{}")
+        _set_url(monkeypatch.setenv, server)
+        assert PhotoHandlerDescription().get_description("/lib/dog.jpg") == ("a dog", "{}")
     finally:
         server.shutdown()
 
@@ -207,14 +286,10 @@ class _MonkeyPatch:
         self._saved = []
 
     def setenv(self, key, value):
-        import os
-
         self._saved.append((key, os.environ.get(key)))
         os.environ[key] = value
 
     def undo(self):
-        import os
-
         for key, value in reversed(self._saved):
             if value is None:
                 os.environ.pop(key, None)
@@ -225,12 +300,15 @@ class _MonkeyPatch:
 
 def _main():
     tests = [
-        test_returns_description_and_map_from_object,
-        test_type_param_is_forwarded,
-        test_indexed_but_no_description_returns_empty,
-        test_outside_library_returns_empty,
-        test_no_library_open_returns_empty,
-        test_unreadable_path_raises,
+        test_path_returns_description_and_map,
+        test_path_type_param_is_forwarded,
+        test_path_outside_library_returns_empty,
+        test_path_unreadable_raises,
+        test_image_lookup_by_hash,
+        test_image_type_param_is_forwarded,
+        test_image_unknown_hash_returns_empty,
+        test_image_missing_file_raises,
+        test_is_changed_tracks_content,
         test_unreachable_raises,
         test_bare_string_response,
     ]

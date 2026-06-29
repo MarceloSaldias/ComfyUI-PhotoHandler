@@ -4,8 +4,15 @@ A custom [ComfyUI](https://github.com/comfyanonymous/ComfyUI) node that fetches
 image descriptions from [PhotoHandler](https://github.com/MarceloSaldias) via its
 local HTTP agent API.
 
-The node — **PhotoHandler Description** — takes an absolute image path and returns
-the description PhotoHandler has stored for that image.
+Two nodes are provided:
+
+- **PhotoHandler Description** — takes an absolute image **path** and returns the
+  description PhotoHandler stored for that image.
+- **PhotoHandler Description (Image)** — takes an **image** (upload widget) and
+  looks the description up by the file's **SHA-256**. Use this when ComfyUI
+  doesn't have PhotoHandler's original path — e.g. an image dragged into ComfyUI
+  is copied into `ComfyUI/input/`, so its path differs but its bytes (and hash)
+  are identical to PhotoHandler's stored `file_hash`.
 
 ## Requirements
 
@@ -35,28 +42,53 @@ Then restart ComfyUI. The node appears under the **PhotoHandler** category as
 
 ## Usage
 
-1. Add the **PhotoHandler Description** node to your graph
-   (right-click → *Add Node* → *PhotoHandler* → *PhotoHandler Description*).
-2. Set the `path` input to the **absolute path** of an image PhotoHandler knows
-   about (it must live inside the library currently open in PhotoHandler).
-3. Optionally set `description_type` to pick a specific *typed* description.
-4. Read the outputs:
-   - **`description`** — the single selected description string.
-   - **`descriptions_json`** — a JSON object string of every named description
-     type → text (e.g. `{"Clothing": "...", "Scene": "..."}`).
+### PhotoHandler Description (by path)
 
-Under the hood the node issues:
+1. Add the node (right-click → *Add Node* → *PhotoHandler* → *PhotoHandler
+   Description*).
+2. Set `path` to the **absolute path** of an image PhotoHandler knows about (it
+   must live inside the library currently open in PhotoHandler).
+3. Optionally set `description_type` to pick a specific *typed* description.
+4. Read the `description` / `descriptions_json` outputs (see below).
+
+Under the hood:
 
 ```
 GET http://127.0.0.1:17843/api/assets/by-path/description?path=<urlencoded-path>[&type=<name>]
 ```
 
+### PhotoHandler Description (Image) (by SHA-256)
+
+1. Add the **PhotoHandler Description (Image)** node.
+2. Drop an image onto its `image` widget (or pick one already in `input/`).
+3. Optionally set `description_type`.
+4. Read the same outputs.
+
+The node hashes the file's bytes (SHA-256, matching PhotoHandler's scanner) and
+looks up by hash — so it works even when the image was copied into ComfyUI's
+`input/` and the original library path is gone:
+
+```
+GET http://127.0.0.1:17843/api/assets/by-hash/description?hash=<sha256>[&type=<name>]
+```
+
+> **The by-hash route is not in PhotoHandler yet.** It's a small addition to the
+> hybrid agent; the exact server-side change is specced in
+> [`docs/server-by-hash-endpoint.md`](docs/server-by-hash-endpoint.md). Until it
+> lands, the by-path node works but the image node will error.
+
+> **Hash the file, not the pixels.** The match relies on the *original file
+> bytes*. The image widget resolves to the verbatim upload in `input/`, so the
+> hash matches. Re-encoding or saving the image elsewhere changes the bytes and
+> the hash won't match.
+
 ### Inputs
 
-| Input              | Type   | Required | Description                                                                 |
-| ------------------ | ------ | -------- | --------------------------------------------------------------------------- |
-| `path`             | STRING | yes      | Absolute on-disk path of the image, inside PhotoHandler's open library.     |
-| `description_type` | STRING | no       | Named typed description to select (e.g. `Clothing`). Empty → default type.  |
+| Input              | Node           | Type   | Required | Description                                                               |
+| ------------------ | -------------- | ------ | -------- | ------------------------------------------------------------------------- |
+| `path`             | Description    | STRING | yes      | Absolute on-disk path, inside PhotoHandler's open library.                |
+| `image`            | Description (Image) | IMAGE upload | yes | Image file; hashed and looked up by SHA-256.                       |
+| `description_type` | both           | STRING | no       | Named typed description to select (e.g. `Clothing`). Empty → default type.|
 
 ### Outputs
 
