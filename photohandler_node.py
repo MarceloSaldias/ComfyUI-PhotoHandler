@@ -170,6 +170,70 @@ def _resolve_image_path(image):
         return image
 
 
+def _load_image_tensor(path):
+    """Load an image file into ComfyUI's (IMAGE, MASK) tensors.
+
+    Replicates the core of ComfyUI's built-in ``LoadImage`` (EXIF transpose,
+    multi-frame handling, alpha -> mask). ``torch`` / ``numpy`` / ``PIL`` are
+    imported lazily — they are always present inside ComfyUI but not required
+    just to import this module or to do a description-only lookup.
+    """
+    import numpy as np
+    import torch
+    from PIL import Image, ImageOps, ImageSequence
+
+    try:
+        import node_helpers  # ComfyUI helper; tolerates odd image files
+
+        def _pillow(fn, *args):
+            return node_helpers.pillow(fn, *args)
+    except Exception:  # noqa: BLE001 - not running inside ComfyUI
+        def _pillow(fn, *args):
+            return fn(*args)
+
+    img = _pillow(Image.open, path)
+
+    output_images = []
+    output_masks = []
+    width, height = None, None
+    excluded_formats = ["MPO"]
+
+    for frame in ImageSequence.Iterator(img):
+        frame = _pillow(ImageOps.exif_transpose, frame)
+
+        if frame.mode == "I":
+            frame = frame.point(lambda px: px * (1 / 255))
+        rgb = frame.convert("RGB")
+
+        if len(output_images) == 0:
+            width, height = rgb.size
+        if rgb.size != (width, height):
+            continue
+
+        arr = np.array(rgb).astype(np.float32) / 255.0
+        output_images.append(torch.from_numpy(arr)[None,])
+
+        if "A" in frame.getbands():
+            mask = np.array(frame.getchannel("A")).astype(np.float32) / 255.0
+            mask = 1.0 - torch.from_numpy(mask)
+        elif frame.mode == "P" and "transparency" in frame.info:
+            alpha = frame.convert("RGBA").getchannel("A")
+            mask = np.array(alpha).astype(np.float32) / 255.0
+            mask = 1.0 - torch.from_numpy(mask)
+        else:
+            mask = torch.zeros((64, 64), dtype=torch.float32, device="cpu")
+        output_masks.append(mask.unsqueeze(0))
+
+    if len(output_images) > 1 and img.format not in excluded_formats:
+        image = torch.cat(output_images, dim=0)
+        mask = torch.cat(output_masks, dim=0)
+    else:
+        image = output_images[0]
+        mask = output_masks[0]
+
+    return (image, mask)
+
+
 def _optional_description_type():
     return {"description_type": ("STRING", {"default": "", "multiline": False})}
 
@@ -228,8 +292,8 @@ class PhotoHandlerDescriptionByImage:
             "optional": _optional_description_type(),
         }
 
-    RETURN_TYPES = ("STRING", "STRING")
-    RETURN_NAMES = ("description", "descriptions_json")
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "STRING")
+    RETURN_NAMES = ("image", "mask", "description", "descriptions_json")
     FUNCTION = "get_description"
     CATEGORY = "PhotoHandler"
 
@@ -254,7 +318,11 @@ class PhotoHandlerDescriptionByImage:
                 )
             ) from exc
 
+        image_tensor, mask_tensor = _load_image_tensor(path)
+
         params = {"hash": file_hash}
         if description_type:
             params["type"] = description_type
-        return _fetch_description("by-hash", params)
+        description, descriptions_json = _fetch_description("by-hash", params)
+
+        return (image_tensor, mask_tensor, description, descriptions_json)

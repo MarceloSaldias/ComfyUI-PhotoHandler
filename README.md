@@ -62,7 +62,11 @@ GET http://127.0.0.1:17843/api/assets/by-path/description?path=<urlencoded-path>
 1. Add the **PhotoHandler Description (Image)** node.
 2. Drop an image onto its `image` widget (or pick one already in `input/`).
 3. Optionally set `description_type`.
-4. Read the same outputs.
+4. Read its outputs. In addition to `description` / `descriptions_json`, this
+   node also outputs the decoded **`image`** (IMAGE) and **`mask`** (MASK) — just
+   like the built-in *Load Image* node — so you can feed the picture straight
+   into the rest of your graph. This makes it a drop-in image loader that also
+   returns the PhotoHandler description.
 
 The node hashes the file's bytes (SHA-256, matching PhotoHandler's scanner) and
 looks up by hash — so it works even when the image was copied into ComfyUI's
@@ -92,10 +96,12 @@ GET http://127.0.0.1:17843/api/assets/by-hash/description?hash=<sha256>[&type=<n
 
 ### Outputs
 
-| Output              | Type   | Description                                                                  |
-| ------------------- | ------ | ---------------------------------------------------------------------------- |
-| `description`       | STRING | Selected description: the `description_type` one, else the default, else the legacy single description. Empty string when none. |
-| `descriptions_json` | STRING | JSON map of all named typed descriptions (`{}` when none).                   |
+| Output              | Node                | Type   | Description                                                                  |
+| ------------------- | ------------------- | ------ | ---------------------------------------------------------------------------- |
+| `image`             | Description (Image) | IMAGE  | The decoded image (same format as *Load Image*), for chaining downstream.    |
+| `mask`              | Description (Image) | MASK   | Alpha-derived mask (zeros when the image has no alpha).                       |
+| `description`       | both                | STRING | Selected description: the `description_type` one, else the default, else the legacy single description. Empty string when none. |
+| `descriptions_json` | both                | STRING | JSON map of all named typed descriptions (`{}` when none).                   |
 
 ### Typed vs. legacy descriptions
 

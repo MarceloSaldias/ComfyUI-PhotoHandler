@@ -17,11 +17,32 @@ import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+import photohandler_node
 from photohandler_node import (
     PhotoHandlerDescription,
     PhotoHandlerDescriptionByImage,
     _sha256_file,
 )
+
+
+class _StubLoader:
+    """Temporarily replace _load_image_tensor with a sentinel-returning stub.
+
+    Image decoding needs torch/numpy/PIL and a valid image file; those are
+    out of scope for the HTTP/hash tests, so we stub the loader and assert the
+    sentinels are passed straight through to the node's outputs.
+    """
+
+    image = "IMG_TENSOR"
+    mask = "MASK_TENSOR"
+
+    def __enter__(self):
+        self._orig = photohandler_node._load_image_tensor
+        photohandler_node._load_image_tensor = lambda path: (self.image, self.mask)
+        return self
+
+    def __exit__(self, *exc):
+        photohandler_node._load_image_tensor = self._orig
 
 
 class _FakeHandler(BaseHTTPRequestHandler):
@@ -190,7 +211,10 @@ def test_image_lookup_by_hash(monkeypatch):
     try:
         _set_url(monkeypatch.setenv, server)
         # folder_paths is absent outside ComfyUI, so `image` is used as a path.
-        desc, maps = PhotoHandlerDescriptionByImage().get_description(path)
+        with _StubLoader():
+            image, mask, desc, maps = PhotoHandlerDescriptionByImage().get_description(path)
+        assert image == "IMG_TENSOR"
+        assert mask == "MASK_TENSOR"
         assert desc == "matched by hash"
         assert json.loads(maps) == {"Scene": "matched by hash"}
     finally:
@@ -213,7 +237,9 @@ def test_image_type_param_is_forwarded(monkeypatch):
     try:
         _set_url(monkeypatch.setenv, server)
         node = PhotoHandlerDescriptionByImage()
-        assert node.get_description(path, "Clothing")[0] == "for-Clothing"
+        with _StubLoader():
+            # outputs: (image, mask, description, descriptions_json)
+            assert node.get_description(path, "Clothing")[2] == "for-Clothing"
     finally:
         server.shutdown()
         os.remove(path)
@@ -224,7 +250,9 @@ def test_image_unknown_hash_returns_empty(monkeypatch):
     server = _start_server(hash_responses={})  # unknown hash -> empty 200
     try:
         _set_url(monkeypatch.setenv, server)
-        assert PhotoHandlerDescriptionByImage().get_description(path) == ("", "{}")
+        with _StubLoader():
+            result = PhotoHandlerDescriptionByImage().get_description(path)
+        assert result == ("IMG_TENSOR", "MASK_TENSOR", "", "{}")
     finally:
         server.shutdown()
         os.remove(path)
@@ -252,6 +280,28 @@ def test_is_changed_tracks_content(monkeypatch):
             handle.write(b"content-2-different")
         second = PhotoHandlerDescriptionByImage.IS_CHANGED(path)
         assert first != second
+    finally:
+        os.remove(path)
+
+
+def test_load_image_tensor_real(monkeypatch):
+    # Real decode path; needs torch/numpy/PIL (always present in ComfyUI).
+    try:
+        import numpy as np  # noqa: F401
+        import torch  # noqa: F401
+        from PIL import Image
+    except Exception:
+        print("    (skipped: torch/numpy/PIL not installed)")
+        return
+
+    fd, path = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    try:
+        Image.new("RGBA", (8, 4), (10, 20, 30, 255)).save(path)
+        image, mask = photohandler_node._load_image_tensor(path)
+        # IMAGE is (batch, H, W, 3); MASK is (batch, H, W).
+        assert tuple(image.shape) == (1, 4, 8, 3)
+        assert image.shape[0] == mask.shape[0]
     finally:
         os.remove(path)
 
@@ -309,6 +359,7 @@ def _main():
         test_image_unknown_hash_returns_empty,
         test_image_missing_file_raises,
         test_is_changed_tracks_content,
+        test_load_image_tensor_real,
         test_unreachable_raises,
         test_bare_string_response,
     ]
